@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import threading
-from typing import Dict, List, Literal, Optional
+from typing import Dict, Literal, Optional
 
 import httpx
 import streamlit as st
 
 from app.transcription.audio import start_stream, stop_stream
-from app.transcription.transcriber import LiveTranscriber, TranscriptEvent
+from app.transcription.session import TranscriptSession
+from app.transcription.transcriber import LiveTranscriber
 from app.utils.logger import get_logger
 from app.utils.urdu_text import render_urdu
 from config.settings import get_settings
 
 StatusState = Literal["IDLE", "RECORDING", "PROCESSING", "NOTE_READY", "ERROR"]
+
+# How often the live transcript panel refreshes while recording, in seconds.
+_LIVE_REFRESH_SECONDS = 1.0
+# How long to wait for Speechmatics to flush final transcripts after stopping.
+_STOP_TIMEOUT_SECONDS = 10.0
 
 _logger = get_logger(__name__)
 
@@ -22,12 +28,10 @@ def _init_session_state() -> None:
 
     defaults = {
         "recording": False,
-        "transcript_lines": [],  # type: ignore[list-item]
-        "partial_text": "",
+        "session": TranscriptSession(),
         "structured_note": None,
         "status": "IDLE",
         "error_message": None,
-        "transcriber": None,
         "transcription_thread": None,
     }
     for key, value in defaults.items():
@@ -35,45 +39,26 @@ def _init_session_state() -> None:
             st.session_state[key] = value
 
 
-def on_partial_transcript(text: str) -> None:
-    """Update the last transcript line with a partial transcription."""
+def _run_transcription_thread(session: TranscriptSession) -> None:
+    """Background worker that manages audio capture and live transcription.
 
-    st.session_state.partial_text = text
+    This runs outside the Streamlit script context, so it only writes to the
+    thread-safe `session` and never touches ``st.session_state``.
 
+    Args:
+        session: Shared buffer that receives transcript events and errors.
+    """
 
-def on_final_transcript(text: str) -> None:
-    """Append a finalized transcript line to the session state."""
-
-    if text:
-        lines: List[str] = st.session_state.transcript_lines
-        lines.append(text)
-        st.session_state.transcript_lines = lines
-    st.session_state.partial_text = ""
-
-
-def _run_transcription_thread() -> None:
-    """Background worker that manages audio capture and live transcription."""
-
-    settings = get_settings()
-
-    def _on_partial(event: TranscriptEvent) -> None:
-        on_partial_transcript(event.text)
-
-    def _on_final(event: TranscriptEvent) -> None:
-        on_final_transcript(event.text)
-
-    transcriber = LiveTranscriber(settings=settings, on_partial=_on_partial, on_final=_on_final)
-    st.session_state.transcriber = transcriber
+    transcriber = LiveTranscriber(
+        settings=get_settings(), on_partial=session.add_partial, on_final=session.add_final
+    )
 
     try:
         with start_stream() as mic_stream:
             transcriber.start(mic_stream)
     except Exception as exc:
         _logger.exception("Error during live transcription: %s", exc)
-        st.session_state.status = "ERROR"
-        st.session_state.error_message = str(exc)
-    finally:
-        st.session_state.recording = False
+        session.fail(str(exc))
 
 
 def start_recording() -> None:
@@ -82,14 +67,14 @@ def start_recording() -> None:
     if st.session_state.recording:
         return
 
+    session = TranscriptSession()
+    st.session_state.session = session
     st.session_state.recording = True
     st.session_state.status = "RECORDING"
-    st.session_state.transcript_lines = []
-    st.session_state.partial_text = ""
     st.session_state.structured_note = None
     st.session_state.error_message = None
 
-    thread = threading.Thread(target=_run_transcription_thread, daemon=True)
+    thread = threading.Thread(target=_run_transcription_thread, args=(session,), daemon=True)
     st.session_state.transcription_thread = thread
     thread.start()
 
@@ -97,32 +82,27 @@ def start_recording() -> None:
 def stop_and_generate() -> None:
     """Stop recording and request structured note generation from the API."""
 
-    if not st.session_state.recording and st.session_state.status != "RECORDING":
+    if not st.session_state.recording:
         return
 
     st.session_state.status = "PROCESSING"
     st.session_state.recording = False
 
-    transcriber: Optional[LiveTranscriber] = st.session_state.get("transcriber")
-    if transcriber is not None:
-        try:
-            transcriber.stop()
-        except Exception as exc:  # pragma: no cover - defensive
-            _logger.warning("Error while stopping transcriber: %s", exc)
-
     try:
+        # Closing the stream signals end of audio so Speechmatics can flush.
         stop_stream()
     except Exception as exc:  # pragma: no cover - defensive
         _logger.warning("Error while stopping audio stream: %s", exc)
 
     thread: Optional[threading.Thread] = st.session_state.get("transcription_thread")
     if thread is not None and thread.is_alive():
-        thread.join(timeout=5)
+        thread.join(timeout=_STOP_TIMEOUT_SECONDS)
 
-    transcript_text = "\n".join(st.session_state.transcript_lines).strip()
+    session: TranscriptSession = st.session_state.session
+    transcript_text = session.transcript
     if not transcript_text:
         st.session_state.status = "ERROR"
-        st.session_state.error_message = "No transcript recorded."
+        st.session_state.error_message = session.error or "No transcript recorded."
         return
 
     settings = get_settings()
@@ -189,25 +169,43 @@ def _render_top_bar() -> None:
             st.button("Stop & Generate Note", on_click=stop_and_generate, disabled=stop_disabled)
 
 
+def _render_live_transcript() -> None:
+    """Render transcript lines from the shared session.
+
+    Runs as a fragment that refreshes on a timer while recording, so live
+    updates from the worker thread appear without a full page rerun.
+    """
+
+    session: TranscriptSession = st.session_state.session
+
+    if st.session_state.recording and session.error:
+        st.session_state.recording = False
+        st.session_state.status = "ERROR"
+        st.session_state.error_message = session.error
+        st.rerun()
+
+    lines, partial = session.snapshot()
+    for line in lines:
+        st.markdown(render_urdu(line))
+
+    if partial:
+        st.markdown(f"<i>{render_urdu(partial)}</i>", unsafe_allow_html=True)
+
+
 def _render_transcript_panel() -> None:
     """Render the live transcript panel."""
 
     st.subheader("Live Transcript")
-    transcript_container = st.container()
-    with transcript_container:
-        for line in st.session_state.transcript_lines:
-            st.markdown(render_urdu(line))
+    run_every = _LIVE_REFRESH_SECONDS if st.session_state.recording else None
+    st.fragment(_render_live_transcript, run_every=run_every)()
 
-        if st.session_state.partial_text:
-            partial = render_urdu(st.session_state.partial_text)
-            st.markdown(f"<i>{partial}</i>", unsafe_allow_html=True)
-
+    transcript = st.session_state.session.transcript
     st.download_button(
         label="Download Transcript (.txt)",
-        data="\n".join(st.session_state.transcript_lines),
+        data=transcript,
         file_name="transcript.txt",
         mime="text/plain",
-        disabled=not st.session_state.transcript_lines,
+        disabled=st.session_state.recording or not transcript,
     )
 
 

@@ -164,7 +164,7 @@ The test suite mocks Speechmatics and the LLM backend, so it runs offline with n
 ## Roadmap
 
 - Speaker diarisation (label doctor vs patient lines)
-- Streaming note generation and live UI refresh via `st.fragment`
+- Streaming note generation
 - PDF export and session history
 - ICD-10 code suggestions and HL7 FHIR export
 

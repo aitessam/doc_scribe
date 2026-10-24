@@ -61,7 +61,8 @@ class MicStream:
             size: Requested byte size (not enforced).
 
         Returns:
-            bytes: The next queued audio chunk.
+            bytes: The next queued audio chunk, or ``b""`` once `stop_stream()`
+            has been called, which signals end of stream to Speechmatics.
 
         Raises:
             AudioCaptureError: If the queue read fails unexpectedly.
@@ -96,14 +97,14 @@ def start_stream() -> Generator[MicStream, None, None]:
         dtype="int16",
     )
 
-    try:
-        # Clear any stale buffers before starting a new session.
-        while not audio_q.empty():
-            try:
-                audio_q.get_nowait()
-            except queue.Empty:
-                break
+    # Clear any stale buffers (including a previous end-of-stream marker).
+    while not audio_q.empty():
+        try:
+            audio_q.get_nowait()
+        except queue.Empty:
+            break
 
+    try:
         stream = sd.InputStream(
             samplerate=audio_config.sample_rate,
             channels=audio_config.channels,
@@ -112,10 +113,11 @@ def start_stream() -> Generator[MicStream, None, None]:
         )
         stream.start()
         _active_stream = stream
-
-        yield MicStream()
     except Exception as exc:
         raise AudioCaptureError("Failed to start microphone audio stream.", cause=exc) from exc
+
+    try:
+        yield MicStream()
     finally:
         stop_stream()
 
@@ -123,7 +125,10 @@ def start_stream() -> Generator[MicStream, None, None]:
 def stop_stream() -> None:
     """Stop and close the active microphone stream and perform cleanup.
 
-    This function is safe to call multiple times.
+    An empty chunk is queued after the stream closes so that a blocked
+    `MicStream.read()` returns and Speechmatics ends the session gracefully,
+    flushing any remaining final transcripts. This function is safe to call
+    multiple times.
 
     Raises:
         AudioCaptureError: If the audio stream cannot be stopped/closed cleanly.
@@ -140,4 +145,5 @@ def stop_stream() -> None:
         raise AudioCaptureError("Failed to stop/close microphone audio stream.", cause=exc) from exc
     finally:
         _active_stream = None
+        audio_q.put(b"")
 
